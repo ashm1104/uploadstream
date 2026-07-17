@@ -1,0 +1,26 @@
+I'm designing a deterministic statistical significance step (Z-score style anomaly flagging) that will run in Databricks before data reaches our LLM pipeline. I need precise facts from the codebase, not summaries.
+
+Examine these files:
+1. packages/store_data_tap/src/.../merch/queries.py
+2. packages/store_data_tap/src/.../merch/model.py
+3. packages/store_data_tap/src/.../merch/aggregate.py
+4. packages/store_data_tap/src/.../fresh_ops/queries.py (briefly - just note where it differs from merch)
+5. packages/briefing_research/.../context/vertex.py and context/research.py
+6. packages/store_data_tap/src/.../groundtruth.py
+
+For each, report:
+- Key functions with one-line purpose each
+- EXACT metric/column names (sales, units, WTD comparisons, like-store fields, etc.)
+- Date ranges queried: how many days/weeks of history do the Databricks queries actually pull? Quote the date filter logic verbatim
+- Grain of the data: is it per store per department per day? Per week? Per category?
+- The exact output schema (dataclass/pydantic/dict fields) of the anomaly or metric records in model.py
+- In aggregate.py: the transformation sequence from raw query rows to final records
+- In vertex.py/research.py: how ground-truth data is inserted into the LLM prompt - is it rendered as text, JSON, markdown tables? Show a small sample of the format
+- In groundtruth.py: the structure of the written ground-truth documents
+
+Also answer:
+- Is there any existing statistics, thresholding, or filtering logic anywhere (even simple percent-change cutoffs)? Quote it
+- Does anything already compute averages over historical windows?
+- Where does like-store comparison data enter, and at what grain?
+
+Output as a structured markdown doc I can copy elsewhere. Include short verbatim code snippets for schemas, date filters, and any threshold logic. Do not modify any files.
