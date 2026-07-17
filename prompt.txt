@@ -24,3 +24,44 @@ Also answer:
 - Where does like-store comparison data enter, and at what grain?
 
 Output as a structured markdown doc I can copy elsewhere. Include short verbatim code snippets for schemas, date filters, and any threshold logic. Do not modify any files.
+
+
+Follow-up fact-finding. Same rules: precise facts, verbatim snippets, no
+summaries, do not modify files. Repo root: store-leader-assist/packages/
+(currently contains briefing_research and store_data_tap).
+
+MISSION 0 — does the new staged pipeline exist here?
+Internal docs describe a newer package "briefing_pipeline" (ticket SAAI-362)
+with concepts: EvidenceSet, numeric corpus, observe/hydrate/cull stages,
+deterministic detectors, verifiers. Search this repo thoroughly for it:
+- grep for: EvidenceSet, numeric corpus, hydrate, cull, observe, detector,
+  ModelRetry, briefing_pipeline, SAAI-362
+- check all branches if possible (git branch -a), and any sibling folders
+If found: report its location and directory tree (2 levels).
+If NOT found: say so explicitly - "briefing_pipeline not in this repo" -
+and skip Mission 1.
+
+
+MISSION 1 — hunt for daily-grain sales data (do this regardless)
+Search the ENTIRE repo - both packages, all SQL strings, tests, configs,
+AGENTS.md, READMEs, .gitlab-ci.yml, Dockerfile, any notebooks:
+1. Grep for date-like columns in SQL: ID_DATE, REPT_DT, SALES_DT, DT_,
+   CAL_DT, _daily, ORD_DT. List EVERY Databricks table name mentioned
+   anywhere in the repo, with schema prefix (prod.dsr / prod.serve / other)
+   and what grain the surrounding SQL implies.
+2. For the dsr_hist_sales_*_dashboard_duration tables: any hint (comments,
+   docstrings, column names) of an underlying daily-grain table they
+   aggregate from?
+3. Any code that BUILDS those dashboard tables (dbt, notebooks, SQL files)?
+4. In briefing_research specifically, check: database.py, models.py,
+   ground_truth.py, cron.py, researchers/sales_merchandising.py,
+   prompts/persona.py - for MISSION 2 purposes report any SQL, plus:
+   quote verbatim any prompt text in persona.py that instructs the LLM
+   about significance, importance, prioritization, or comparing numbers.
+5. departments.json in briefing_research/data: list its structure briefly.
+
+Report as structured markdown. For anything not found, write "not found in
+repo" - never guess.
+
+
+
