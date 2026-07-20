@@ -71,8 +71,9 @@ Track A re-ranks. Only Track B can filter or redirect generation.
   carry `department`, `sub_department`, `department_number`,
   `sub_department_number` columns, validated against
   `VALID_DEPARTMENT_NUMBERS` at generation time.
-- For only those departments (~10 per store), pull rolling history from
-  Databricks, compute the z-score (Section 4), attach
+- For only those departments (~10 per store), compute significance per
+  Section 4 — cross-sectional immediately (existing tables), time-series once
+  the daily-grain source is confirmed — and attach
   `significance: pass | fail | insufficient_history` per recommendation, and
   re-sort: failures sink to the bottom of the feed.
 - Storage: add a nullable JSONB or three typed columns to `recommendations`
@@ -107,7 +108,26 @@ about; it can never surface anomalies the LLM missed.
   (`ACTUAL_SALES` equivalent at daily grain). ~12 rows/store/day.
 - Items, transactions, GP: v2 candidates once department-level is validated.
 
-### Baseline and window
+### Two complementary computations
+
+1. **Cross-sectional z (target vs peer distribution) — no blockers, ships
+   immediately.** `dsr_hist_sales_dept_dashboard_duration` already holds every
+   store's TY/LY department sales per window. For a given department and
+   window, pull growth across the full peer set (region slice or all ~450
+   stores), and score where the target sits in that distribution using the
+   same robust math below. This is exactly the Produce/Blooms logic in
+   Section 2 ("−6.83% while the peer median is −9%" → not significant) and
+   requires **no new tables**.
+2. **Time-series robust z (target vs its own history) — needs the
+   daily-grain source (open question 1).** Same-day-of-week robust z as
+   specified below.
+
+The axes are complementary: cross-sectional catches "is this store diverging
+from the market?"; time-series catches "is this store diverging from its own
+normal?" v1 flags on either axis and records which fired (`method` in the
+output contract).
+
+### Baseline and window (time-series axis)
 
 - **28-day window, not 30.** 28 days = exactly four of each weekday, so the
   weekday mix inside the window is constant. A 30-day window carries an
@@ -155,7 +175,7 @@ One row per store × department × metric × as-of date:
 store_id, department_number, metric, as_of_date,
 actual_value, baseline_value, sigma,
 z_score, is_significant (bool), significance_tier (normal|significant|critical),
-insufficient_history (bool), computed_at
+method (cross_sectional | time_series), insufficient_history (bool), computed_at
 ```
 
 Field names chosen to be directly insertable into the SAAI-362 EvidenceSet
@@ -180,7 +200,102 @@ nightly by the runner. The Python layer only consumes the ~12 result rows per
 store. Choice between materialized view vs on-the-fly query depends on the
 daily table's size/latency — resolved once open question 1 is answered.
 
-## 6. Illustrative worked example (synthetic values, method demonstration)
+## 6. Implementation plan (code map)
+
+### New package: `store_data_tap/src/store_data_tap/significance/`
+
+Mirrors the existing `merch/` / `fresh_ops/` structure:
+
+```
+significance/
+  __init__.py
+  compute.py     # pure math - no I/O, no Databricks (unit-testable in isolation)
+  queries.py     # SQL builders (plain functions returning strings)
+  model.py       # SignificanceResult dataclass (the Section 4 output contract)
+```
+
+`compute.py` core (pure functions, `_shared.py` conventions — None-safe, no
+side effects):
+
+```python
+def robust_z(history: list[float], today: float) -> ZResult | None:
+    """Same-weekday robust z. None if len(history) < SIGNIFICANCE_MIN_WEEKS."""
+    med = _median(history)
+    mad = _median([abs(v - med) for v in history])
+    spread = max(1.4826 * mad, SIGNIFICANCE_SIGMA_FLOOR * abs(med))
+    return ZResult(z=(today - med) / spread, baseline=med, sigma=spread)
+
+def cross_sectional_z(peer_values: list[float], target_value: float) -> ZResult | None:
+    """Where does the target sit vs the peer distribution? Same math, peer axis."""
+```
+
+`queries.py` builders:
+
+```python
+def dept_peer_growth_query(dept: str, duration: str) -> str:
+    # existing dept_dashboard_duration table, all stores' TY/LY for one
+    # dept+window -> cross-sectional axis. No new tables.
+
+def dept_daily_history_query(corp_id: int, days: int = 56) -> str:
+    # PLACEHOLDER pending open question 1 (daily-grain table name).
+```
+
+Both plug into the generic `DatabricksQueryRunner.run(sql)` unchanged.
+`config.py` gains the four `SIGNIFICANCE_*` constants (Section 4).
+
+### Track A wiring (`briefing_research`) — three touches
+
+1. New `significance.py` with one entry point:
+
+   ```python
+   def annotate_run(run: Run, runner) -> Run:
+       depts = {r.department_number for r in run.recommendations if r.department_number}
+       # compute z for only those departments -> attach -> re-sort (failures sink)
+   ```
+
+2. `cron.py` hook (between research() and save_run(), ~line 58):
+
+   ```python
+   run = sales_merchandising.research(ground_truth_set, ...)
+   run = significance.annotate_run(run, runner)   # <- new line
+   database.save_run(run)
+   ```
+
+3. Additive migration + matching `models.py` fields:
+
+   ```sql
+   ALTER TABLE recommendations
+     ADD COLUMN z_score numeric,
+     ADD COLUMN is_significant boolean,
+     ADD COLUMN significance_computed_at timestamptz;
+   ```
+
+### Track B wiring — four thin touches
+
+1. Databricks-side window-function SQL (or materialized view) over the daily
+   table — written once open question 1 resolves.
+2. `merch/model.py`: `DeptPerf` gains `baseline / sigma / z_score /
+   is_significant`, all defaulted to `None` (existing call sites untouched).
+3. `merch/aggregate.py`: one join step in `parse_departments` merging
+   significance rows by department number.
+4. `merch/render.py` + `persona.py`: two new department-table columns; one
+   new prompt rule (Section 3, Track B).
+
+### Build order
+
+1. `compute.py` + unit tests — zero dependencies, zero blockers. **Start here.**
+2. `config.py` constants + `model.py` dataclass.
+3. `dept_peer_growth_query` + cross-sectional path — ships without waiting
+   on anyone.
+4. Track A hook (annotate_run, cron line, migration) — quick fix live for
+   pilot stores.
+5. Time-series query the day the daily table name arrives — drops into the
+   already-built `compute.py`.
+6. Track B render/persona changes last, behind the shadow period.
+
+Steps 1–4 are roughly 300 lines total including tests.
+
+## 7. Illustrative worked example (synthetic values, method demonstration)
 
 Produce, trailing 8 Tuesdays (synthetic but realistic):
 `29.8, 30.4, 28.9, 31.2, 30.1, 29.5, 44.0*, 30.6` (k$) — `*` one-off event day.
@@ -193,7 +308,7 @@ Produce, trailing 8 Tuesdays (synthetic but realistic):
 - Counterexample: a day at 26.0 → z ≈ −4.4 → **critical** — flagged even
   though "only" −14% vs baseline, because Produce's normal wobble is tiny.
 
-## 7. Rollout & validation
+## 8. Rollout & validation
 
 1. **Shadow period (1–2 weeks):** compute and log flags for pilot stores
    without changing ranking or prompts. Compare flags against the SAAI-261
@@ -207,12 +322,14 @@ Produce, trailing 8 Tuesdays (synthetic but realistic):
    source is confirmed; run both tracks briefly, then Track A's computation
    collapses into a lookup of Track B's output.
 
-## 8. Open questions
+## 9. Open questions
 
 1. **Daily-grain source table:** `prod.dsr` is a downstream analytics copy;
    no store × department × day sales table is discoverable from this repo
    (all `dsr` tables are duration-bucket grain). Need the upstream table
-   name/schema from the data platform team. *Blocks Track B only.*
+   name/schema from the data platform team. *Blocks the time-series
+   computation on both tracks; the cross-sectional computation is unaffected
+   and ships now.*
 2. **Field naming with SAAI-362:** confirm output-contract names against the
    EvidenceSet numeric corpus so Bob's pipeline consumes the flag unchanged.
 3. **Track A UX:** do failed recommendations sink to the bottom, or render
@@ -221,7 +338,7 @@ Produce, trailing 8 Tuesdays (synthetic but realistic):
 4. **Threshold governance:** are 2.0/3.0 global, or per-department overrides
    in config (e.g. inherently volatile depts like Blooms)?
 
-## 9. Relationship to SAAI-362 (staged briefing pipeline)
+## 10. Relationship to SAAI-362 (staged briefing pipeline)
 
 Same leadership directive — deterministic rules decide, generative model
 writes — different gaps: SAAI-362's verifiers guarantee stated numbers are

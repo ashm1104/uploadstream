@@ -19,6 +19,8 @@ Three facts from code research:
 ## 4. The fix (one breath)
 Per store × department, from ~28 days of daily history: baseline + normal wobble + **z = (today − baseline) / wobble**. |z| ≥ 2 → significant (<5% chance it's noise). Deterministic: same data in, same flag out. Refinements: **28 days not 30** (exactly 4 of each weekday), **same-day-of-week windows** (Tue vs past Tuesdays), **median/MAD** (freak days can't poison the baseline). Prompt rule change: *significance is pre-computed — never judge magnitude yourself.*
 
+**Two axes:** **cross-sectional** (target vs all-stores peer distribution — existing `dept_dashboard_duration` table, **zero blockers, ships now**) + **time-series** (target vs its own 28-day history — needs the daily-grain table). Flag on either; cross-sectional IS the Produce/Blooms logic above.
+
 ## 5. Two tracks (agreed with Dominic)
 - **Track A — quick fix, post-generation**: recommendations carry structured `department_number` columns → z-score **only the ~10 departments mentioned** → pass/fail flag → re-sort, failures sink. Hook: `cron.py`, between in-memory `Run` and `save_run()`.
 - **Track B — long-term, pre-generation**: new **parallel query** in `store_data_tap` computes significance for all depts nightly, upstream of everything; fields ride data → markdown → prompt → and into Bob's pipeline when it lands.
@@ -32,6 +34,16 @@ Runner is fully generic (`run(sql)`, any read-only string, zero coupling). New q
 Same philosophy (deterministic decides, LLM writes), **different problems**: his verifiers prove numbers are *true*; our flag proves they're *worth saying*. His detectors fire on dollar size only. We're upstream — he inherits our flag for free.
 
 ## 8. The asks (close here)
-1. **Daily-grain table name** — `prod.dsr` is a downstream copy; no store × dept × day sales table visible from repo. Only real blocker, only for Track B.
+1. **Daily-grain table name** — `prod.dsr` is a downstream copy; no store × dept × day sales table visible from repo. Blocks **time-series math only** — the cross-sectional path ships now.
 2. **Sync with Bob** on field naming (drop-in to his EvidenceSet later).
 3. **GitLab access** (in progress) → design doc goes up as **draft MR** on ticket branch.
+
+## 9. What we build (order)
+New `store_data_tap/.../significance/` package (`compute.py` pure math, `queries.py`, `model.py`) mirroring merch/fresh_ops conventions.
+1. `compute.py` + unit tests — zero deps, zero blockers, **start here**
+2. `config.py` constants + result dataclass
+3. Cross-sectional peer query (existing tables) — ships without waiting on anyone
+4. Track A hook: `annotate_run()` in new `briefing_research/significance.py`, one line in `cron.py` (between `research()` and `save_run()`), additive 3-column migration on `recommendations`
+5. Time-series query the day the daily table name arrives
+6. Track B: `DeptPerf` fields → `aggregate.py` join → `render.py` columns → `persona.py` rule
+Steps 1–4 ≈ 300 lines including tests.
