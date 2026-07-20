@@ -1,65 +1,8 @@
-Statistical significance for sales anomalies — design proposal
-Status: draft, looking for feedback. Ticket: SAAI-XXX.
-Background: how data flows today
-Quick recap of the nightly pipeline for anyone landing here fresh.
-Each night, per store, briefing_research resolves the store's like-stores from store_groups.yaml, then store_data_tap pulls sales data from Databricks. The important detail: everything we pull comes from the prod.dsr dashboard tables, which are pre-aggregated into duration buckets — "Yesterday", "WTD", "Last Week". One row per store/department/bucket. The Python side never sees individual days.
-Those rows get parsed into dataclasses (store KPIs, ~12 department rows, item movers, displays, celebrations), rendered into markdown docs, and uploaded to GCS. The prompt builder then concatenates: persona + target store docs + both like-store docs into one large text prompt, sends it to Gemini via Vertex, validates the returned recommendations (department numbers are checked against the known department list), and saves everything to Postgres — runs, recommendations, actions. The store leader app reads those tables in the morning.
-The problem
-The model is currently the one deciding which changes are "significant", and we give it nothing to decide with.
-Every number in the prompt is a point-in-time comparison — this window vs the same window last year. There's no history, no trend, no sense of how much a department normally fluctuates. So when the model sees "Produce −4.5%", it has no way to know whether Produce usually moves ±1% (in which case this is alarming) or ±6% (in which case it's a Tuesday). Whatever significance judgment it makes is invented.
-Worth being honest about the current state of the codebase here: the only comparison primitive we have is growth_pct (a single TY/LY point ratio), and the only filtering anywhere is dollar floors — MATERIAL_SALES_MIN = 100.0 for movers, top-50 caps, the 80% FPP threshold. There is no mean, stddev, or z-score anywhere in either package. Meanwhile our own eval rubric already scores briefings on "Materiality — effect big enough vs normal week-to-week noise?" — so we're grading the model on a question the pipeline never computes. This proposal closes that gap.
-A concrete example
-From store 385's ground truth (2026-06-17), WTD growth vs LY:
-Department
-SA08 (target)
-SA29
-SA23
-Produce
-−6.83%
-−8.89%
-−15.16%
-Blooms
-+18.96%
-−24.04%
-+0.47%
-Produce looks bad in isolation, and today's pipeline would likely surface it. But SA08 is actually the best performer in its peer group — this is a market-wide dip, not a store problem. Flagging it wastes the leader's morning. Blooms is the opposite: +19% against a peer at −24% is a real divergence and genuinely worth a card.
-A ranking driven by raw %-change gets both of these wrong. That's the whole argument in one table.
-Proposal: compute significance deterministically, two tracks
-The core idea is to move the significance decision out of the model and into plain math that runs before (or on) the data, then tell the model to act on the computed flag instead of judging magnitudes itself.
-One framing that clarifies where the computation has to live: it depends on what we do with a failed flag. If failing the test just means "sort this lower in the feed", the test can run after generation — it's a placement algorithm. But if failing means "don't show this at all" (or "don't spend a generation slot on it"), the test has to run before generation, at the data layer — by the time the model has written about something insignificant, the slot is already spent. So:
-Track A — quick win, post-generation re-ranking
-After generation, we know exactly which departments the recommendations touch — each recommendation row carries validated department_number / sub_department_number columns, so this is a field read, not text parsing. For just those ~10 departments, compute significance, attach a pass/fail flag, and re-sort so failures sink to the bottom. The hook point is clean: in cron.py, the Run object sits fully formed in memory between sales_merchandising.research(...) and database.save_run(run) — the pass goes exactly there. Storage is an additive migration on recommendations (z_score, is_significant, significance_computed_at).
-Cheap, ships fast, touches no prompts. Its honest limitation: it can demote noise the model wrote about, but it can never surface an anomaly the model missed. That's what Track B is for.
-Track B — long-term, pre-generation at the data layer
-A standalone significance computation runs nightly for all store × department rows, upstream of prompt assembly. The new fields (baseline, sigma, z_score, is_significant) ride the existing path — dataclasses → ground-truth markdown → prompt — and the persona gains an explicit rule: significance is pre-computed, only discuss flagged rows, never judge magnitude yourself. Because the flag lives in the data itself, anything downstream inherits it, including the staged pipeline work on SAAI-362 once that lands (the field names below are chosen with its numeric corpus in mind; worth a quick sync to confirm).
-Once Track B runs nightly for everything, Track A's computation collapses into a lookup of already-computed flags — so these aren't two systems, just one calculation with two consumption points.
-The calculation
-Two complementary axes:
-Cross-sectional — is this store diverging from its peers? The dsr_hist_sales_dept_dashboard_duration table already contains every store's TY/LY department sales per window, so for any department we can pull the growth distribution across the full peer set and score where the target sits. This needs no new tables and is exactly the Produce/Blooms logic above. It also has a nice property: since all peers share the same week, weather, and holidays, market-wide effects cancel out automatically.
-Time-series — is this store diverging from its own history? For this we need daily-grain data (store × department × day), which does not exist in any table reachable from this repo — the dsr tables are bucket-grain, and prod.dsr is a downstream analytics copy built elsewhere. Identifying the upstream daily table is the one open dependency (see open questions). The method once we have it: a 28-day window rather than 30 (28 days = exactly four of each weekday, so the weekday mix in the window is stable), comparing same-day-of-week only — this Tuesday against the trailing 8 Tuesdays — which removes day-of-week seasonality entirely.
-For both axes, robust statistics rather than plain mean/stddev:
-baseline = median(comparison set)
-spread   = 1.4826 × MAD           # MAD = median absolute deviation
-z        = (value − baseline) / spread
-Median/MAD means one freak day (or one weird peer store) can't inflate the spread and mask real anomalies. Thresholds: |z| ≥ 2.0 → significant, ≥ 3.0 → critical, all as named constants in config.py per house convention.
-Edge cases we've thought through: fewer than 8 weeks of history (new or remodeled stores) → no flag, marked insufficient data, never demoted; a near-zero spread (a department that sells almost identically every day) → spread floored at a small fraction of the baseline so z can't explode; zero-sales days excluded from baselines; peers with trivial sales in a department (< $500 in the window) excluded from the cross-sectional distribution so they don't pollute it; department renames handled by keying on department number.
-A quick worked example of the robust-spread property, with synthetic numbers: eight Tuesdays of Produce at 29.8, 30.4, 28.9, 31.2, 30.1, 29.5, 44.0, 30.6 (k$) — that 44.0 was a one-off event day. Median 30.25, MAD 0.65, spread ≈ 0.96. Today at 29.36 → z ≈ −0.9, not significant. With plain mean/stddev the 44.0 day would inflate σ to ~5 and hide nearly everything. Same data, honest spread.
-Implementation sketch
-New package store_data_tap/src/store_data_tap/significance/ following the same conventions as merch/ and fresh_ops/:
-compute.py — pure math (robust_z, cross_sectional_z, classify), no I/O, fully unit-testable
-queries.py — dept_peer_growth_query (existing table, works today) and a stubbed dept_daily_history_query that raises until the daily table is identified
-model.py — the result dataclass / output contract:
-store_id, department_number, metric, as_of_date,
-actual_value, baseline_value, sigma,
-z_score, is_significant, significance_tier (normal|significant|critical),
-method (cross_sectional | time_series), insufficient_history, computed_at
-The query runner is already generic (run(sql) takes any read-only string), which is why this is a parallel query rather than a modification of the existing builders — those hit bucket tables that can't express a time series anyway, and leaving them untouched means zero regression surface.
-Track A wiring is three small pieces in briefing_research: a new significance.py with annotate_run(run, runner) (best-effort — any failure logs a warning and returns the run unchanged, so the briefing never dies because of this pass), the one-line cron hook, and the additive migration. Build order: pure math + tests first, then the cross-sectional path (no blockers), then the Track A hook, then time-series the day the table name arrives, and the render/persona changes last behind a shadow period.
-Rollout
-Shadow first: compute and log flags for pilot stores without changing anything user-facing, and sanity-check flag rates (at 2σ we'd expect roughly 1–2 significant departments per store per day; if every store lights up 6+, the thresholds or the peer set need another look). Then enable Track A re-ranking for pilots, tune, and only then move on to Track B's prompt changes.
-Open questions
-What's the upstream daily-grain sales table (store × department × day) behind the dsr dashboard aggregates? Blocks the time-series axis on both tracks; the cross-sectional axis is unaffected and can ship now.
-Field naming alignment with the SAAI-362 evidence model, so the flag drops in without rework when that branch merges.
-Peer set for the cross-sectional axis: all stores, a region slice, or format tier? (Affects how tight the distribution is.)
-Track A UX: should failed recommendations just sink, or also render with a "routine variance" annotation?
-Are the 2.0 / 3.0 thresholds global, or do inherently volatile departments (Blooms, Floral-type categories) get per-department overrides?
+Hi Bob, sharing a quick status on the significance task:
+
+- Quick win is implemented - since daily history isn't available yet, I built the peer-comparison version: each recommendation's department gets checked against how all other stores moved for the same window, and ones that are just following the market get sorted lower. Hooks in after generation, before DB save, nothing else touched. Testing locally right now.
+- Long term - starting to hunt for the daily-grain sales table (our current tables are all pre-rolled into yesterday/WTD buckets, so no 30-day baseline is possible from them). Will check Confluence and the data platform team. Math side is already done, so it plugs in the moment we find the table.
+- Design doc is ready, will go up as a draft MR once my GitLab access lands (Dominic's on it).
+- Would also love 15 min with you at some point to match field names with your pipeline's evidence model, so this drops in cleanly when your branch merges.
+
+Questions for you when you get a chance: peer set - all stores or region-level? And failed recommendations - sink quietly or show a "routine variance" tag?
