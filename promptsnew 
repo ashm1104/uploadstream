@@ -1,0 +1,25 @@
+Small follow-up, same rules: facts and verbatim snippets, no modifications.
+
+1. store_data_tap: query.py, snapshot.py, storage.py (and cli.py briefly):
+   - How is SQL actually executed against Databricks? (connector library,
+     auth, the runner class/function signature). Quote the runner interface.
+   - What would adding a NEW standalone query involve - is the runner
+     generic (any SQL string) or coupled to specific builders?
+   - snapshot.py and storage.py: what do they do, one paragraph each.
+
+2. briefing_research/database.py:
+   - Full schema of the recommendations/runs/actions tables (verbatim
+     CREATE TABLE or model definitions).
+   - Critically: does each stored recommendation carry a department field
+     or any structured link to departments/items it's about? Or is
+     department only inside free text/JSON? Quote the relevant columns.
+
+3. briefing_research/cron.py:
+   - The nightly sequence of steps in order (short list), and where a
+     post-generation step could be inserted after recommendations exist
+     but before they're persisted/served.
+
+
+Open briefing_research/ground_truth/385-ground-truth-2026-06-17.md and paste, verbatim, the Sales by Department daily table and the like-store comparison table.
+
+
