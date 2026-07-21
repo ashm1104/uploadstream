@@ -1,0 +1,8 @@
+Question 1 — the direct hunt:
+"Is there a data dictionary or table catalog for the prod.dsr schema in Databricks? I'm specifically looking for a table with daily-grain sales — one row per store per department per day (not pre-aggregated into Yesterday/WTD/Last Week buckets). What's the table name and which team owns it?"
+Question 2 — the upstream question:
+"The dsr_hist_sales_dept_dashboard_duration table aggregates sales into duration buckets. What is the source table these dashboard tables are built from, and is there documentation on that pipeline or dbt model?"
+Question 3 — the people, not the table:
+"Which team owns the prod.dsr sales data in Databricks, and who is the data steward or point of contact for questions about store/department daily sales tables?"
+Question 4 — the sideways route:
+"Are there any documented Databricks tables containing daily store sales history — for trend analysis, forecasting, or year-over-year reporting — at store and department level?"
